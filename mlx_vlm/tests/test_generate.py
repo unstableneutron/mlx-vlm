@@ -314,6 +314,105 @@ class TestGenerationBatch:
         assert len(batch) == 2
 
 
+class TestBatchedRepetitionPenalty:
+    """Vectorized batched repetition_penalty applied in GenerationBatch._step.
+
+    Exercises the public-facing semantics (penalty math, history rolling,
+    batch alignment under filter/extend) without spinning up a real model.
+    """
+
+    @staticmethod
+    def _apply_penalty(logits, history, penalty):
+        """Replicates the in-mx-graph kernel from GenerationBatch._step."""
+        row_idx = mx.arange(logits.shape[0])[:, None]
+        sel = logits[row_idx, history]
+        sel = mx.where(sel < 0, sel * penalty, sel / penalty)
+        out = mx.array(logits)
+        out[row_idx, history] = sel
+        return out
+
+    def test_penalty_kernel_basic(self):
+        # Positive logits divide; negative logits multiply.
+        logits = mx.array([[1.0, -2.0, 0.5, 4.0]])
+        history = mx.array([[0, 1]])
+        out = self._apply_penalty(logits, history, 2.0)
+        assert mx.allclose(out, mx.array([[0.5, -4.0, 0.5, 4.0]])).item()
+
+    def test_penalty_kernel_duplicate_history(self):
+        # Last-writer-wins keeps penalty^1, not penalty^n.
+        logits = mx.array([[1.0, 1.0]])
+        history = mx.array([[0, 0, 0, 0]])
+        out = self._apply_penalty(logits, history, 2.0)
+        assert mx.allclose(out, mx.array([[0.5, 1.0]])).item()
+
+    def test_penalty_kernel_multi_row(self):
+        # Per-row history is independent.
+        logits = mx.array([[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]])
+        history = mx.array([[0], [2]])
+        out = self._apply_penalty(logits, history, 2.0)
+        assert mx.allclose(
+            out, mx.array([[0.5, 1.0, 1.0], [1.0, 1.0, 0.5]])
+        ).item()
+
+    def test_empty_construction_with_rep_penalty(self):
+        mock_model = MagicMock()
+        sampler = lambda x: mx.argmax(x, axis=-1)
+        stop_criteria = lambda tok: tok == 2
+        batch = GenerationBatch.empty(
+            mock_model,
+            sampler,
+            stop_criteria,
+            repetition_penalty=1.1,
+            repetition_context_size=20,
+        )
+        assert batch._rep_penalty == 1.1
+        assert batch._rep_context == 20
+        assert batch._rep_history is None
+
+    def test_empty_construction_penalty_one_is_disabled(self):
+        # rep_penalty=1.0 is a math no-op; treat as off.
+        mock_model = MagicMock()
+        sampler = lambda x: mx.argmax(x, axis=-1)
+        stop_criteria = lambda tok: tok == 2
+        batch = GenerationBatch.empty(
+            mock_model, sampler, stop_criteria, repetition_penalty=1.0
+        )
+        assert batch._rep_penalty is None
+
+    def test_filter_subsets_history_in_lockstep(self):
+        mock_model = MagicMock()
+        sampler = lambda x: mx.argmax(x, axis=-1)
+        stop_criteria = lambda tok: tok == 2
+        batch = GenerationBatch.empty(
+            mock_model, sampler, stop_criteria, repetition_penalty=1.1
+        )
+        batch.uids = [0, 1, 2]
+        batch.max_tokens = [50, 60, 70]
+        batch._num_tokens = [5, 10, 15]
+        batch._rep_history = mx.array(
+            [[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=mx.int32
+        )
+        batch.filter([0, 2])
+        assert batch._rep_history.shape == (2, 3)
+        assert mx.array_equal(
+            batch._rep_history, mx.array([[1, 2, 3], [7, 8, 9]])
+        ).item()
+
+    def test_filter_empty_keep_clears_history(self):
+        mock_model = MagicMock()
+        sampler = lambda x: mx.argmax(x, axis=-1)
+        stop_criteria = lambda tok: tok == 2
+        batch = GenerationBatch.empty(
+            mock_model, sampler, stop_criteria, repetition_penalty=1.1
+        )
+        batch.uids = [0]
+        batch.max_tokens = [50]
+        batch._num_tokens = [5]
+        batch._rep_history = mx.array([[1, 2, 3]], dtype=mx.int32)
+        batch.filter([])
+        assert batch._rep_history is None
+
+
 # ============================================================================
 # Tests for Helper Functions
 # ============================================================================

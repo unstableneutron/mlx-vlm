@@ -1486,6 +1486,9 @@ class GenerationBatch:
         stop_criteria,
         max_tokens: List[int],
         top_logprobs_k: int = 0,
+        logits_processors: Optional[List[Callable]] = None,
+        repetition_penalty: Optional[float] = None,
+        repetition_context_size: int = 20,
     ):
         self.model = model
         self._language_model = getattr(model, "language_model", model)
@@ -1508,6 +1511,21 @@ class GenerationBatch:
         # Per-sequence MRoPE delta
         self._rope_deltas = None
 
+        # Vectorized batched repetition penalty.  Maintains a single
+        # ``(B, K)`` ring buffer of recent token ids as an ``mx.array``
+        # and applies the penalty to logits in one vectorized op
+        # without any Python-side host syncs (no ``.tolist()``,
+        # ``.item()``, or per-row loops).  Other ``logits_processors``
+        # fall back to a per-row Python loop in ``_step()``.
+        self._logits_processors: List[Callable] = list(logits_processors or [])
+        self._rep_penalty: Optional[float] = (
+            float(repetition_penalty)
+            if repetition_penalty is not None and repetition_penalty != 1.0
+            else None
+        )
+        self._rep_context: int = int(repetition_context_size)
+        self._rep_history: Optional[mx.array] = None  # (B, K) int32
+
     def __len__(self):
         return len(self.uids)
 
@@ -1527,8 +1545,62 @@ class GenerationBatch:
         logits = output.logits if hasattr(output, "logits") else output
         logits = logits[:, -1, :]
 
+        # Vectorized batched repetition penalty.  ``logits`` is ``(B, V)``
+        # and ``_rep_history`` is ``(B, K)`` of recent token ids.  We
+        # gather the penalized columns row-wise, scale, then scatter
+        # back -- all in mx graph, no host syncs.
+        #
+        # Note: when a token id appears more than once in the history
+        # window, the scatter writes the same penalized value back
+        # multiple times (last-writer-wins with identical writes), so
+        # the effective penalty stays ``penalty`` rather than
+        # ``penalty^n``.  This matches mlx_lm's reference behavior on
+        # presence-based penalty.
+        if self._rep_penalty is not None and self._rep_history is not None:
+            hist = self._rep_history  # (B, K) int32
+            row_idx = mx.arange(logits.shape[0])[:, None]
+            sel = logits[row_idx, hist]
+            sel = mx.where(
+                sel < 0, sel * self._rep_penalty, sel / self._rep_penalty
+            )
+            logits[row_idx, hist] = sel
+
+        # Slow-path fallback for arbitrary logits processors.  Loops
+        # over the batch dim in Python; only intended for small batches
+        # / debugging.  Most production callers should use the fast
+        # vectorized rep-penalty path above.
+        if self._logits_processors:
+            tokens_list = (
+                self._rep_history.tolist()
+                if self._rep_history is not None
+                else [[] for _ in range(logits.shape[0])]
+            )
+            rows = []
+            for i in range(logits.shape[0]):
+                row = logits[i : i + 1, :]
+                for proc in self._logits_processors:
+                    row = proc(tokens_list[i], row)
+                rows.append(row)
+            logits = mx.concatenate(rows, axis=0)
+
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         sampled = self.sampler(logprobs)
+
+        # Update the ``(B, K)`` ring buffer with the newly sampled
+        # tokens.  Lazy-init seeds every slot with the first sampled
+        # token, which is a deliberate no-op: gather/scatter on
+        # ``hist[i, :] = [t, t, ..., t]`` reads and writes the same
+        # logit, so the penalty has no effect on step 1.
+        if self._rep_penalty is not None:
+            sampled_col = sampled.astype(mx.int32)[:, None]
+            if self._rep_history is None:
+                self._rep_history = mx.broadcast_to(
+                    sampled_col, (sampled.shape[0], self._rep_context)
+                )
+            else:
+                self._rep_history = mx.concatenate(
+                    [self._rep_history[:, 1:], sampled_col], axis=1
+                )
 
         self._next_tokens = sampled
         prev_top_idx = self._next_top_idx
@@ -1622,11 +1694,38 @@ class GenerationBatch:
         elif other._rope_deltas is not None:
             self._rope_deltas = mx.concatenate([self._rope_deltas, other._rope_deltas])
 
+        # Inherit rep-penalty config + extend the ``(B, K)`` history
+        # buffer along the batch axis.  ``_rep_context`` is a
+        # generation-level constant so all batches in a single
+        # ``BatchGenerator`` run share the same ``K``; mismatched
+        # shapes here would indicate a caller bug and are left to fail
+        # loudly via ``mx.concatenate``'s shape check.
+        if self._rep_penalty is None and other._rep_penalty is not None:
+            self._rep_penalty = other._rep_penalty
+            self._rep_context = other._rep_context
+        if self._rep_penalty is not None:
+            if self._rep_history is None and other._rep_history is not None:
+                self._rep_history = other._rep_history
+            elif (
+                self._rep_history is not None
+                and other._rep_history is not None
+            ):
+                self._rep_history = mx.concatenate(
+                    [self._rep_history, other._rep_history], axis=0
+                )
+        if not self._logits_processors and other._logits_processors:
+            self._logits_processors = list(other._logits_processors)
+
     def filter(self, keep: List[int]):
         """Filter the batch to keep only the specified indices."""
         self.uids = [self.uids[idx] for idx in keep]
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
         self._num_tokens = [self._num_tokens[idx] for idx in keep]
+        # Subset ``(B, K)`` rep history in lockstep with uids.
+        if self._rep_history is not None:
+            self._rep_history = (
+                self._rep_history[mx.array(keep)] if keep else None
+            )
 
         if not keep:
             self.prompt_cache.clear()
@@ -1694,7 +1793,15 @@ class GenerationBatch:
 
     @classmethod
     def empty(
-        cls, model, sampler, stop_criteria, compute_logprobs=True, top_logprobs_k=0
+        cls,
+        model,
+        sampler,
+        stop_criteria,
+        compute_logprobs=True,
+        top_logprobs_k=0,
+        logits_processors=None,
+        repetition_penalty: Optional[float] = None,
+        repetition_context_size: int = 20,
     ):
         """Create an empty generation batch."""
         batch = cls.__new__(cls)
@@ -1715,6 +1822,14 @@ class GenerationBatch:
         batch._next_top_idx = None
         batch._next_top_lp = None
         batch._rope_deltas = None
+        batch._logits_processors = list(logits_processors or [])
+        batch._rep_penalty = (
+            float(repetition_penalty)
+            if repetition_penalty is not None and repetition_penalty != 1.0
+            else None
+        )
+        batch._rep_context = int(repetition_context_size)
+        batch._rep_history = None
         return batch
 
 
@@ -1791,7 +1906,14 @@ class PromptProcessingBatch:
         return n
 
     def generate(
-        self, sampler, stop_criteria, compute_logprobs=True, top_logprobs_k=0
+        self,
+        sampler,
+        stop_criteria,
+        compute_logprobs=True,
+        top_logprobs_k=0,
+        logits_processors=None,
+        repetition_penalty: Optional[float] = None,
+        repetition_context_size: int = 20,
     ) -> GenerationBatch:
         """Process final tokens and transition to GenerationBatch."""
         output = self.model(
@@ -1814,7 +1936,19 @@ class PromptProcessingBatch:
             stop_criteria=stop_criteria,
             max_tokens=list(self.max_tokens),
             top_logprobs_k=top_logprobs_k,
+            logits_processors=logits_processors,
+            repetition_penalty=repetition_penalty,
+            repetition_context_size=repetition_context_size,
         )
+        # Seed ``(B, K)`` history with the first sampled token so the
+        # ring buffer is populated before ``_step`` runs.  The first
+        # generated token is itself unpenalized (matches sequential
+        # ``generate_step`` semantics for the prompt boundary).
+        if gen_batch._rep_penalty is not None:
+            gen_batch._rep_history = mx.broadcast_to(
+                first_tokens.astype(mx.int32)[:, None],
+                (first_tokens.shape[0], gen_batch._rep_context),
+            )
         gen_batch.compute_logprobs = compute_logprobs
 
         if compute_logprobs:
@@ -1878,6 +2012,9 @@ class BatchGenerator:
         compute_logprobs: bool = True,
         top_logprobs_k: int = 0,
         stream=None,
+        logits_processors: Optional[List[Callable]] = None,
+        repetition_penalty: Optional[float] = None,
+        repetition_context_size: int = 20,
     ):
         self.model = model
         self.max_tokens = max_tokens
@@ -1888,6 +2025,13 @@ class BatchGenerator:
         self.quantized_kv_start = quantized_kv_start
         self.compute_logprobs = compute_logprobs
         self.top_logprobs_k = top_logprobs_k
+        self._logits_processors: List[Callable] = list(logits_processors or [])
+        self._repetition_penalty: Optional[float] = (
+            float(repetition_penalty)
+            if repetition_penalty is not None and repetition_penalty != 1.0
+            else None
+        )
+        self._repetition_context_size: int = int(repetition_context_size)
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
@@ -1907,6 +2051,9 @@ class BatchGenerator:
             self.tokenizer.stopping_criteria,
             compute_logprobs=self.compute_logprobs,
             top_logprobs_k=self.top_logprobs_k,
+            logits_processors=self._logits_processors,
+            repetition_penalty=self._repetition_penalty,
+            repetition_context_size=self._repetition_context_size,
         )
         self._prompt_batch: Optional[PromptProcessingBatch] = None
         self._unprocessed_sequences = []
@@ -2044,6 +2191,9 @@ class BatchGenerator:
                 self.tokenizer.stopping_criteria,
                 compute_logprobs=self.compute_logprobs,
                 top_logprobs_k=self.top_logprobs_k,
+                logits_processors=self._logits_processors,
+                repetition_penalty=self._repetition_penalty,
+                repetition_context_size=self._repetition_context_size,
             )
             self._prompt_time_counter += time.perf_counter() - tic
             self._generation_batch.extend(gen_batch)
@@ -2106,6 +2256,9 @@ class BatchGenerator:
                     self.tokenizer.stopping_criteria,
                     compute_logprobs=self.compute_logprobs,
                     top_logprobs_k=self.top_logprobs_k,
+                    logits_processors=self._logits_processors,
+                    repetition_penalty=self._repetition_penalty,
+                    repetition_context_size=self._repetition_context_size,
                 )
                 self._prompt_time_counter += time.perf_counter() - tic
                 self._generation_batch.extend(gen_batch)
@@ -2345,6 +2498,17 @@ def _generate_batch(
         kwargs.pop("prefill_step_size", None)
         kwargs["prefill_step_size"] = None
 
+    # Repetition penalty takes the vectorized fast path inside
+    # ``BatchGenerator``; ``logit_bias`` and any caller-supplied
+    # ``logits_processors`` go through the slow per-row Python fallback
+    # in ``GenerationBatch._step``.
+    rep_pen = kwargs.pop("repetition_penalty", None)
+    rep_ctx = kwargs.pop("repetition_context_size", 20)
+    logit_bias = kwargs.pop("logit_bias", None)
+    extra_processors = list(kwargs.pop("logits_processors", None) or [])
+    if logit_bias:
+        extra_processors.extend(make_logits_processors(logit_bias, None, 0))
+
     # Use batch_size for prefill and completion to ensure consistent processing
     gen = BatchGenerator(
         model.language_model,
@@ -2352,6 +2516,9 @@ def _generate_batch(
         prefill_batch_size=batch_size,
         completion_batch_size=batch_size,
         compute_logprobs=False,
+        logits_processors=extra_processors,
+        repetition_penalty=rep_pen,
+        repetition_context_size=rep_ctx,
         **kwargs,
     )
 
